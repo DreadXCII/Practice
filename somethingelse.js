@@ -2,5 +2,5 @@
 
 console.log("Hello world!");
 
-print("I'm still learning this ish")
+print("I'm still learning this stuff")
 
