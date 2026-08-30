@@ -1,8 +1,5 @@
-// I'm your daddy now
-
-console.log("Hello world!");
-
-// that ain't javascript bruh
+// If you install node, you'll be able to run this in your terminal
+// Ex: node somethingelse.js
 
 // function declaration; 'height' is a parameter = argument fed to a function
 function make_mario_stairs(height) {
