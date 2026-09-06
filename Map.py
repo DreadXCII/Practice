@@ -484,3 +484,6 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = BattleMapApp(root)
     root.mainloop()
+
+    app.run(debug=True)
+    
