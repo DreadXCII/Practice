@@ -3,13 +3,22 @@ Battle Map - a DnD map tool in Python (tkinter)
 -------------------------------------------------
 Upload a map image, place monster/player/ally tokens on it, drag them
 around, zoom and pan, rename tokens, and remove them.
- 
+
 Requires:
-    pip install Pillow
- 
+    pip install Pillow supabase
+
 On Linux, tkinter itself sometimes needs a separate system package:
     sudo apt install python3-tk
- 
+
+Cloud save (optional):
+    Set two environment variables before running, or edit the
+    SUPABASE_URL / SUPABASE_KEY constants below directly:
+        SUPABASE_URL=https://your-project-ref.supabase.co
+        SUPABASE_KEY=your-anon-or-service-key
+    Requires a "tokens" table and a "token-icons" storage bucket -
+    see the setup notes near the SUPABASE_URL constant below.
+    If these aren't set, the app still runs fully, just without saving.
+
 Controls:
     Upload map          - choose an image file to use as the map
     Move / select       - drag tokens to move them, drag empty space to pan
@@ -19,46 +28,85 @@ Controls:
     Select a token, then press Delete/Backspace - also deletes it
     Scroll wheel         - zoom in/out, centered on the cursor
     Clear tokens         - remove every token
+    Load session         - pull the saved tokens back from Supabase
     Reset view            - re-fit and re-center the map
- 
+
 Token icons:
     Each token can show plain initials (the default), a small built-in
     icon (skull, sword, shield, star, heart), or a custom image you
     upload (e.g. a character portrait), cropped to a circle. Right-click
     a token and choose "Set icon..." to change it.
+
+Saving:
+    Every add, move, rename, icon change, or delete is auto-saved to
+    Supabase immediately (if configured). Use "Load session" to bring
+    a previously saved set of tokens back, e.g. after restarting the app.
 """
- 
+
+import io
 import math
+import os
+import urllib.request
 import tkinter as tk
 from tkinter import filedialog, simpledialog, messagebox
 from PIL import Image, ImageDraw, ImageTk
- 
+
+try:
+    from supabase import create_client
+except ImportError:
+    create_client = None
+
+# ---- Supabase configuration ----
+# Fill these in directly, or set them as environment variables of the
+# same name before launching the app.
+#
+# Expected table (run once in the Supabase SQL editor):
+#     create table tokens (
+#       id bigint generated always as identity primary key,
+#       map_name text not null default 'default',
+#       token_key text not null unique,
+#       type text not null,
+#       label text not null,
+#       x double precision not null,
+#       y double precision not null,
+#       icon_kind text not null default 'none',
+#       icon_name text,
+#       icon_url text,
+#       updated_at timestamptz not null default now()
+#     );
+# Also create a public Storage bucket named "token-icons" for custom images.
+SUPABASE_URL = os.environ.get("https://htqneopwawwnvxsbejqy.supabase.co", "")
+SUPABASE_KEY = os.environ.get("sb_publishable_FJNwYCTE1B7cESxGHN5aqA_AS4Rdo05", "")
+SUPABASE_TABLE = "tokens"
+SUPABASE_BUCKET = "token-icons"
+SUPABASE_MAP_NAME = "default"
+
 TOKEN_COLORS = {
     "monster": "#b0473d",
     "player": "#3f7d8c",
     "ally": "#5c8c4a",
 }
- 
+
 TOKEN_TEXT_COLORS = {
     "monster": "#2a0f0c",
     "player": "#0c2226",
     "ally": "#14210d",
 }
- 
+
 TYPE_LABELS = {"monster": "Monster", "player": "Player", "ally": "Ally"}
- 
+
 MODE_COLORS = {
     "select": "#d3902f",
     "monster": "#b0473d",
     "player": "#3f7d8c",
     "ally": "#5c8c4a",
 }
- 
+
 # Names of the built-in icon glyphs, in the order they're offered in the picker.
 PRESET_ICON_NAMES = ["skull", "sword", "shield", "star", "heart"]
 ICON_GLYPH_COLOR = "#1a1509"
- 
- 
+
+
 def _draw_skull(d, size, color):
     pad = size * 0.14
     d.ellipse([pad, size * 0.10, size - pad, size * 0.68], fill=color)
@@ -67,8 +115,8 @@ def _draw_skull(d, size, color):
     eye_r = size * 0.09
     for ex in (size * 0.33, size * 0.67):
         d.ellipse([ex - eye_r, size * 0.34 - eye_r, ex + eye_r, size * 0.34 + eye_r], fill=(0, 0, 0, 0))
- 
- 
+
+
 def _draw_sword(d, size, color):
     cx = size / 2
     w = size * 0.09
@@ -77,8 +125,8 @@ def _draw_sword(d, size, color):
     d.polygon(tip, fill=color)
     d.line([size * 0.22, size * 0.30, size * 0.78, size * 0.30], fill=color, width=int(size * 0.08))
     d.rectangle([cx - w * 0.7, size * 0.72, cx + w * 0.7, size * 0.92], fill=color)
- 
- 
+
+
 def _draw_shield(d, size, color):
     top_w = size * 0.34
     pts = [
@@ -89,8 +137,8 @@ def _draw_shield(d, size, color):
         (size / 2 - top_w, size * 0.48),
     ]
     d.polygon(pts, fill=color)
- 
- 
+
+
 def _draw_star(d, size, color):
     cx, cy = size / 2, size / 2
     outer_r = size * 0.42
@@ -101,8 +149,8 @@ def _draw_star(d, size, color):
         angle = math.radians(-90 + i * 36)
         points.append((cx + r * math.cos(angle), cy + r * math.sin(angle)))
     d.polygon(points, fill=color)
- 
- 
+
+
 def _draw_heart(d, size, color):
     r = size * 0.24
     d.ellipse([size * 0.14, size * 0.18, size * 0.14 + 2 * r, size * 0.18 + 2 * r], fill=color)
@@ -111,8 +159,8 @@ def _draw_heart(d, size, color):
         [(size * 0.14, size * 0.42), (size * 0.86, size * 0.42), (size / 2, size * 0.90)],
         fill=color,
     )
- 
- 
+
+
 _ICON_DRAW_FUNCS = {
     "skull": _draw_skull,
     "sword": _draw_sword,
@@ -120,8 +168,8 @@ _ICON_DRAW_FUNCS = {
     "star": _draw_star,
     "heart": _draw_heart,
 }
- 
- 
+
+
 def build_icon_image(name, size=64, color=ICON_GLYPH_COLOR):
     """Return a transparent RGBA PIL image containing the named icon glyph."""
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -130,8 +178,8 @@ def build_icon_image(name, size=64, color=ICON_GLYPH_COLOR):
     if draw_func:
         draw_func(d, size, color)
     return img
- 
- 
+
+
 def circular_crop(pil_image, size=200):
     """Center-crop an image to a square, resize it, and apply a circular alpha mask."""
     img = pil_image.convert("RGBA")
@@ -144,56 +192,78 @@ def circular_crop(pil_image, size=200):
     ImageDraw.Draw(mask).ellipse([0, 0, size, size], fill=255)
     img.putalpha(mask)
     return img
- 
- 
+
+
 class BattleMapApp:
     def __init__(self, root):
         self.root = root
         root.title("Battle Map")
         root.geometry("1150x780")
         root.configure(bg="#16130e")
- 
+
         self.mode = tk.StringVar(value="select")
         self.zoom = 1.0
         self.pan_x = 0
         self.pan_y = 0
- 
+
         self.original_image = None
         self.photo_image = None
         self.map_item = None
         self.map_loaded = False
         self.img_w = 0
         self.img_h = 0
- 
+
         self.tokens = []
         self.next_id = 1
         self.counters = {"monster": 0, "player": 0, "ally": 0}
         self.selected_id = None
- 
+
         self.drag_token_id = None
         self.drag_offset = (0, 0)
         self._drag_moved = False
         self._press_pos = (0, 0)
- 
+
         self.panning = False
         self.pan_start = (0, 0)
         self.pan_start_offset = (0, 0)
         self._pan_moved = False
- 
+
+        self.supabase = None
+        self._init_supabase()
+
         self._build_ui()
         self._bind_events()
- 
+
+        if self.supabase is not None:
+            self.set_status("Connected to Supabase. Auto-save is on. No map loaded.")
+        else:
+            self.set_status(
+                "No map loaded. Supabase not configured, so changes won't be saved."
+            )
+
+    def _init_supabase(self):
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            return
+        if create_client is None:
+            print("Supabase saving disabled: run 'pip install supabase' to enable it.")
+            return
+        try:
+            self.supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        except Exception as e:
+            print(f"Supabase saving disabled: could not connect ({e}).")
+            self.supabase = None
+
     # ---------- UI construction ----------
     def _build_ui(self):
         toolbar = tk.Frame(self.root, bg="#211c15", pady=8, padx=10)
         toolbar.pack(side=tk.TOP, fill=tk.X)
- 
+
         tk.Button(
             toolbar, text="Upload map", command=self.upload_map,
             bg="#7a5720", fg="#eadfc4", relief=tk.FLAT, padx=10, pady=4,
             activebackground="#d3902f", activeforeground="#1a1509",
         ).pack(side=tk.LEFT, padx=(0, 10))
- 
+
         mode_frame = tk.Frame(toolbar, bg="#211c15")
         mode_frame.pack(side=tk.LEFT, padx=(0, 10))
         self.mode_buttons = {}
@@ -210,16 +280,20 @@ class BattleMapApp:
             b.pack(side=tk.LEFT, padx=2)
             self.mode_buttons[key] = b
         self._refresh_mode_buttons()
- 
+
         tk.Button(
             toolbar, text="Clear tokens", command=self.clear_tokens,
+            relief=tk.FLAT, padx=8, pady=4, bg="#211c15", fg="#eadfc4",
+        ).pack(side=tk.LEFT, padx=4)
+        tk.Button(
+            toolbar, text="Load session", command=self.load_session,
             relief=tk.FLAT, padx=8, pady=4, bg="#211c15", fg="#eadfc4",
         ).pack(side=tk.LEFT, padx=4)
         tk.Button(
             toolbar, text="Reset view", command=self.fit_to_view,
             relief=tk.FLAT, padx=8, pady=4, bg="#211c15", fg="#eadfc4",
         ).pack(side=tk.LEFT, padx=4)
- 
+
         zoom_frame = tk.Frame(toolbar, bg="#211c15")
         zoom_frame.pack(side=tk.LEFT, padx=10)
         tk.Button(
@@ -234,17 +308,17 @@ class BattleMapApp:
             zoom_frame, text="+", relief=tk.FLAT, width=2, bg="#211c15", fg="#eadfc4",
             command=lambda: self.zoom_by(1.25),
         ).pack(side=tk.LEFT)
- 
+
         self.canvas = tk.Canvas(self.root, bg="#1c1810", highlightthickness=0)
         self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
- 
+
         self.status = tk.Label(
             self.root,
             text="No map loaded. Upload a map image to begin.",
             bg="#211c15", fg="#a89a7c", anchor="w", padx=10, pady=4,
         )
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
- 
+
         self.empty_text = self.canvas.create_text(
             0, 0,
             text=(
@@ -255,20 +329,20 @@ class BattleMapApp:
             fill="#a89a7c", font=("Georgia", 13), justify="center",
             tags=("empty",),
         )
- 
+
     def _refresh_mode_buttons(self):
         for key, btn in self.mode_buttons.items():
             if key == self.mode.get():
                 btn.configure(bg="#2a241b", fg=MODE_COLORS[key])
             else:
                 btn.configure(bg="#211c15", fg="#eadfc4")
- 
+
     def set_mode(self, key):
         self.mode.set(key)
         self._refresh_mode_buttons()
         self.canvas.configure(cursor="crosshair" if key != "select" else "fleur")
         self.deselect()
- 
+
     def _bind_events(self):
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_motion)
@@ -281,7 +355,7 @@ class BattleMapApp:
         self.canvas.bind("<Configure>", self.on_resize)
         self.root.bind("<Delete>", self.on_delete_key)
         self.root.bind("<BackSpace>", self.on_delete_key)
- 
+
     # ---------- Map loading ----------
     def upload_map(self):
         path = filedialog.askopenfilename(
@@ -299,7 +373,7 @@ class BattleMapApp:
         except Exception as e:
             messagebox.showerror("Could not open image", str(e))
             return
- 
+
         self.original_image = img.convert("RGBA")
         self.img_w, self.img_h = self.original_image.size
         self.map_loaded = True
@@ -308,11 +382,11 @@ class BattleMapApp:
         self.set_status(
             f"Map loaded ({self.img_w} x {self.img_h}px). {self.token_count_text()}"
         )
- 
+
     def on_resize(self, event):
         if not self.map_loaded:
             self.canvas.coords(self.empty_text, event.width / 2, event.height / 2)
- 
+
     # ---------- Zoom / pan / rendering ----------
     def fit_to_view(self):
         if not self.map_loaded:
@@ -328,7 +402,7 @@ class BattleMapApp:
         self.pan_y = (vp_h - self.img_h * self.zoom) / 2
         self.redraw_map()
         self.redraw_all_tokens()
- 
+
     def redraw_map(self):
         if not self.map_loaded:
             return
@@ -346,7 +420,7 @@ class BattleMapApp:
             self.canvas.coords(self.map_item, self.pan_x, self.pan_y)
         self.canvas.tag_lower(self.map_item)
         self.zoom_label.configure(text=f"{round(self.zoom * 100)}%")
- 
+
     def zoom_at(self, cx, cy, new_zoom_raw):
         new_zoom = max(0.1, min(5.0, new_zoom_raw))
         world_x = (cx - self.pan_x) / self.zoom
@@ -356,32 +430,32 @@ class BattleMapApp:
         self.zoom = new_zoom
         self.redraw_map()
         self.redraw_all_tokens()
- 
+
     def zoom_by(self, factor):
         if not self.map_loaded:
             return
         cx = self.canvas.winfo_width() / 2
         cy = self.canvas.winfo_height() / 2
         self.zoom_at(cx, cy, self.zoom * factor)
- 
+
     def on_wheel(self, event):
         if not self.map_loaded:
             return
         factor = 1.1 if event.delta > 0 else 1 / 1.1
         self.zoom_at(event.x, event.y, self.zoom * factor)
- 
+
     def on_wheel_linux(self, event, direction):
         if not self.map_loaded:
             return
         factor = 1.1 if direction > 0 else 1 / 1.1
         self.zoom_at(event.x, event.y, self.zoom * factor)
- 
+
     def to_canvas_coords(self, img_x, img_y):
         return self.pan_x + img_x * self.zoom, self.pan_y + img_y * self.zoom
- 
+
     def to_image_coords(self, cx, cy):
         return (cx - self.pan_x) / self.zoom, (cy - self.pan_y) / self.zoom
- 
+
     # ---------- Tokens ----------
     def token_count_text(self):
         m = sum(1 for t in self.tokens if t["type"] == "monster")
@@ -392,7 +466,7 @@ class BattleMapApp:
             f"{p} player{'s' if p != 1 else ''}, "
             f"{a} all{'ies' if a != 1 else 'y'} on the map."
         )
- 
+
     def add_token(self, ttype, img_x, img_y):
         self.counters[ttype] += 1
         token = {
@@ -411,7 +485,8 @@ class BattleMapApp:
         self.tokens.append(token)
         self.draw_token(token)
         self.set_status(f"Placed {token['label']}. {self.token_count_text()}")
- 
+        self.autosave_token(token)
+
     def remove_token(self, token_id):
         token = next((t for t in self.tokens if t["id"] == token_id), None)
         if not token:
@@ -422,13 +497,14 @@ class BattleMapApp:
         if self.selected_id == token_id:
             self.selected_id = None
         self.set_status(f"Token removed. {self.token_count_text()}")
- 
+        self.delete_token_remote(token_id)
+
     def initials(self, label):
         parts = label.split()
         if len(parts) == 1:
             return parts[0][:2].upper()
         return (parts[0][0] + parts[-1][0]).upper()
- 
+
     def draw_token(self, token):
         cx, cy = self.to_canvas_coords(token["x"], token["y"])
         r = 20
@@ -437,14 +513,14 @@ class BattleMapApp:
         outline_width = 4 if self.selected_id == token["id"] else 3
         tag = f"token_{token['id']}"
         canvas_ids = {}
- 
+
         oval = self.canvas.create_oval(
             cx - r, cy - r, cx + r, cy + r, fill=fill,
             outline=outline_color, width=outline_width,
             tags=(tag, "token"),
         )
         canvas_ids["oval"] = oval
- 
+
         if token["icon_kind"] == "custom" and token["icon_image"] is not None:
             inner = int((r - outline_width / 2) * 2 * 0.92)
             resized = token["icon_image"].resize((inner, inner), Image.LANCZOS)
@@ -467,7 +543,7 @@ class BattleMapApp:
                 tags=(tag, "token"),
             )
             canvas_ids["text"] = text
- 
+
         label = self.canvas.create_text(
             cx, cy + r + 12, text=token["label"],
             fill="#eadfc4", font=("Georgia", 9),
@@ -475,25 +551,25 @@ class BattleMapApp:
         )
         canvas_ids["label"] = label
         token["canvas_ids"] = canvas_ids
- 
+
     def redraw_token(self, token):
         for cid in token["canvas_ids"].values():
             self.canvas.delete(cid)
         self.draw_token(token)
- 
+
     def redraw_all_tokens(self):
         for t in self.tokens:
             self.redraw_token(t)
- 
+
     def deselect(self):
         if self.selected_id is not None:
             self.selected_id = None
             self.redraw_all_tokens()
- 
+
     def select_token(self, token_id):
         self.selected_id = token_id
         self.redraw_all_tokens()
- 
+
     def find_token_at(self, cx, cy):
         items = self.canvas.find_overlapping(cx - 3, cy - 3, cx + 3, cy + 3)
         for item in reversed(items):
@@ -501,7 +577,7 @@ class BattleMapApp:
                 if tag.startswith("token_"):
                     return int(tag.split("_")[1])
         return None
- 
+
     def rename_token(self, token_id):
         token = next((t for t in self.tokens if t["id"] == token_id), None)
         if not token:
@@ -513,12 +589,13 @@ class BattleMapApp:
         if new_label:
             token["label"] = new_label.strip()
             self.redraw_token(token)
- 
+            self.autosave_token(token)
+
     def open_icon_picker(self, token_id):
         token = next((t for t in self.tokens if t["id"] == token_id), None)
         if not token:
             return
- 
+
         dialog = tk.Toplevel(self.root)
         dialog.title("Choose an icon")
         dialog.configure(bg="#211c15")
@@ -526,29 +603,31 @@ class BattleMapApp:
         dialog.grab_set()
         dialog.resizable(False, False)
         dialog._photo_refs = []  # keep thumbnail PhotoImages alive while dialog is open
- 
+
         tk.Label(
             dialog, text=f"Icon for \u201c{token['label']}\u201d",
             bg="#211c15", fg="#eadfc4", font=("Georgia", 12), pady=8,
         ).pack()
- 
+
         grid = tk.Frame(dialog, bg="#211c15", padx=12, pady=4)
         grid.pack()
- 
+
         def choose_preset(name):
             token["icon_kind"] = "preset"
             token["icon_name"] = name
             token["icon_image"] = None
             self.redraw_token(token)
+            self.autosave_token(token)
             dialog.destroy()
- 
+
         def choose_none():
             token["icon_kind"] = "none"
             token["icon_name"] = None
             token["icon_image"] = None
             self.redraw_token(token)
+            self.autosave_token(token)
             dialog.destroy()
- 
+
         def choose_custom():
             path = filedialog.askopenfilename(
                 title="Choose an icon image",
@@ -569,8 +648,9 @@ class BattleMapApp:
             token["icon_name"] = None
             token["icon_image"] = circular_crop(img, size=200)
             self.redraw_token(token)
+            self.autosave_token(token)
             dialog.destroy()
- 
+
         # Default / initials option
         default_btn = tk.Button(
             grid, text="Default\n(initials)", width=9, height=3,
@@ -578,7 +658,7 @@ class BattleMapApp:
             command=choose_none,
         )
         default_btn.grid(row=0, column=0, padx=6, pady=6)
- 
+
         # Preset icon options, each with a small rendered preview
         swatch_color = TOKEN_COLORS[token["type"]]
         for i, name in enumerate(PRESET_ICON_NAMES):
@@ -592,7 +672,7 @@ class BattleMapApp:
             preview.alpha_composite(glyph, (offset, offset))
             photo = ImageTk.PhotoImage(preview)
             dialog._photo_refs.append(photo)
- 
+
             btn = tk.Button(
                 grid, image=photo, text=name.capitalize(), compound="top",
                 bg="#2a241b", fg="#eadfc4", relief=tk.FLAT,
@@ -601,19 +681,19 @@ class BattleMapApp:
             col = (i + 1) % 3
             row = (i + 1) // 3
             btn.grid(row=row, column=col, padx=6, pady=6)
- 
+
         tk.Frame(dialog, bg="#3c3527", height=1).pack(fill=tk.X, padx=12, pady=8)
- 
+
         tk.Button(
             dialog, text="Upload custom image...", command=choose_custom,
             bg="#7a5720", fg="#eadfc4", relief=tk.FLAT, padx=10, pady=6,
         ).pack(pady=(0, 8))
- 
+
         tk.Button(
             dialog, text="Cancel", command=dialog.destroy,
             bg="#211c15", fg="#a89a7c", relief=tk.FLAT,
         ).pack(pady=(0, 10))
- 
+
     def clear_tokens(self):
         if not self.tokens:
             return
@@ -625,12 +705,133 @@ class BattleMapApp:
             self.counters = {"monster": 0, "player": 0, "ally": 0}
             self.selected_id = None
             self.set_status("All tokens cleared.")
- 
+            self.clear_tokens_remote()
+
+    # ---------- Supabase persistence ----------
+    def autosave_token(self, token):
+        if self.supabase is None:
+            return
+        try:
+            icon_url = None
+            if token["icon_kind"] == "custom" and token["icon_image"] is not None:
+                buf = io.BytesIO()
+                token["icon_image"].save(buf, format="PNG")
+                buf.seek(0)
+                storage_path = f"{token['id']}.png"
+                self.supabase.storage.from_(SUPABASE_BUCKET).upload(
+                    file=buf.read(),
+                    path=storage_path,
+                    file_options={"content-type": "image/png", "upsert": "true"},
+                )
+                icon_url = self.supabase.storage.from_(SUPABASE_BUCKET).get_public_url(storage_path)
+
+            self.supabase.table(SUPABASE_TABLE).upsert(
+                {
+                    "token_key": str(token["id"]),
+                    "map_name": SUPABASE_MAP_NAME,
+                    "type": token["type"],
+                    "label": token["label"],
+                    "x": token["x"],
+                    "y": token["y"],
+                    "icon_kind": token["icon_kind"],
+                    "icon_name": token["icon_name"],
+                    "icon_url": icon_url,
+                },
+                on_conflict="token_key",
+            ).execute()
+        except Exception as e:
+            self.set_status(f"Save failed: {e}")
+
+    def delete_token_remote(self, token_id):
+        if self.supabase is None:
+            return
+        try:
+            self.supabase.table(SUPABASE_TABLE).delete().eq(
+                "token_key", str(token_id)
+            ).execute()
+            try:
+                self.supabase.storage.from_(SUPABASE_BUCKET).remove([f"{token_id}.png"])
+            except Exception:
+                pass  # fine if there was never a custom icon to remove
+        except Exception as e:
+            self.set_status(f"Remote delete failed: {e}")
+
+    def clear_tokens_remote(self):
+        if self.supabase is None:
+            return
+        try:
+            self.supabase.table(SUPABASE_TABLE).delete().eq(
+                "map_name", SUPABASE_MAP_NAME
+            ).execute()
+        except Exception as e:
+            self.set_status(f"Remote clear failed: {e}")
+
+    def load_session(self):
+        if self.supabase is None:
+            messagebox.showinfo(
+                "Supabase not configured",
+                "Set SUPABASE_URL and SUPABASE_KEY (env vars or in the script) to load a saved session.",
+            )
+            return
+        if self.tokens and not messagebox.askyesno(
+            "Load session", "This replaces your current tokens with the saved session. Continue?"
+        ):
+            return
+        try:
+            response = (
+                self.supabase.table(SUPABASE_TABLE)
+                .select("*")
+                .eq("map_name", SUPABASE_MAP_NAME)
+                .execute()
+            )
+            rows = response.data or []
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+            return
+
+        for t in self.tokens:
+            for cid in t["canvas_ids"].values():
+                self.canvas.delete(cid)
+        self.tokens = []
+        self.counters = {"monster": 0, "player": 0, "ally": 0}
+        self.selected_id = None
+        self.next_id = 1
+
+        for row in rows:
+            icon_image = None
+            if row.get("icon_kind") == "custom" and row.get("icon_url"):
+                try:
+                    with urllib.request.urlopen(row["icon_url"]) as resp:
+                        icon_image = Image.open(io.BytesIO(resp.read())).convert("RGBA")
+                except Exception as e:
+                    self.set_status(f"Could not load icon image: {e}")
+
+            row_id = int(row["token_key"])
+            token = {
+                "id": row_id,
+                "type": row["type"],
+                "label": row["label"],
+                "x": row["x"],
+                "y": row["y"],
+                "canvas_ids": {},
+                "icon_kind": row.get("icon_kind") or "none",
+                "icon_name": row.get("icon_name"),
+                "icon_image": icon_image,
+                "_photo": None,
+            }
+            self.tokens.append(token)
+            self.counters[token["type"]] += 1
+            self.next_id = max(self.next_id, row_id + 1)
+            if self.map_loaded:
+                self.draw_token(token)
+
+        self.set_status(f"Session loaded. {self.token_count_text()}")
+
     # ---------- Mouse handlers ----------
     def on_press(self, event):
         if not self.map_loaded:
             return
- 
+
         tid = self.find_token_at(event.x, event.y)
         if tid is not None:
             token = next(t for t in self.tokens if t["id"] == tid)
@@ -640,7 +841,7 @@ class BattleMapApp:
             self._drag_moved = False
             self._press_pos = (event.x, event.y)
             return
- 
+
         if self.mode.get() == "select":
             self.panning = True
             self._pan_moved = False
@@ -649,7 +850,7 @@ class BattleMapApp:
         else:
             img_x, img_y = self.to_image_coords(event.x, event.y)
             self.add_token(self.mode.get(), img_x, img_y)
- 
+
     def on_motion(self, event):
         if self.drag_token_id is not None:
             dx = event.x - self._press_pos[0]
@@ -664,7 +865,7 @@ class BattleMapApp:
                 token["x"], token["y"] = img_x, img_y
                 self.redraw_token(token)
             return
- 
+
         if self.panning:
             dx = event.x - self.pan_start[0]
             dy = event.y - self.pan_start[1]
@@ -674,23 +875,27 @@ class BattleMapApp:
             self.pan_y = self.pan_start_offset[1] + dy
             self.redraw_map()
             self.redraw_all_tokens()
- 
+
     def on_release(self, event):
         if self.drag_token_id is not None:
             if not self._drag_moved:
                 self.select_token(self.drag_token_id)
+            else:
+                token = next((t for t in self.tokens if t["id"] == self.drag_token_id), None)
+                if token:
+                    self.autosave_token(token)
             self.drag_token_id = None
             return
         if self.panning:
             self.panning = False
             if not self._pan_moved:
                 self.deselect()
- 
+
     def on_double_click(self, event):
         tid = self.find_token_at(event.x, event.y)
         if tid is not None:
             self.rename_token(tid)
- 
+
     def on_right_click(self, event):
         tid = self.find_token_at(event.x, event.y)
         if tid is None:
@@ -702,58 +907,16 @@ class BattleMapApp:
         menu.add_separator()
         menu.add_command(label="Delete", command=lambda: self.remove_token(tid))
         menu.tk_popup(event.x_root, event.y_root)
- 
+
     def on_delete_key(self, event):
         if self.selected_id is not None:
             self.remove_token(self.selected_id)
- 
+
     def set_status(self, text):
         self.status.configure(text=text)
- 
- 
+
+
 if __name__ == "__main__":
     root = tk.Tk()
     app = BattleMapApp(root)
     root.mainloop()
-
-import io
-
-def save_token(token, image=None):
-    icon_url = None
-    if token["icon_kind"] == "custom" and image is not None:
-        buf = io.BytesIO()
-        image.save(buf, format="PNG")
-        buf.seek(0)
-        path = f"{token['id']}.png"
-        supabase.storage.from_("token-icons").upload(
-            file=buf.read(),
-            path=path,
-            file_options={"content-type": "image/png", "upsert": "true"},
-        )
-        icon_url = supabase.storage.from_("token-icons").get_public_url(path)
-
-    supabase.table("tokens").upsert({
-        "id": token["id"],
-        "type": token["type"],
-        "label": token["label"],
-        "x": token["x"],
-        "y": token["y"],
-        "icon_kind": token["icon_kind"],
-        "icon_name": token["icon_name"],
-        "icon_url": icon_url,
-    }).execute()
-
-def load_tokens():
-    response = supabase.table("tokens").select("*").eq("map_name", "default").execute()
-    return response.data
-
-import os
-from supabase import create_client, Client
-
-SUPABASE_URL = "https://htqneopwawwnvxsbejqy.supabase.co"
-SUPABASE_KEY = "sb_publishable_FJNwYCTE1B7cESxGHN5aqA_AS4Rdo05"  # better: load from an env var, not hardcoded
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-
-app.run(debug=True)
